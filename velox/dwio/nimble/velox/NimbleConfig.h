@@ -80,6 +80,23 @@ class Config : public velox::config::ConfigBase {
   static Entry<uint64_t> CHUNKING_WRITER_MIN_CHUNK_SIZE;
   static Entry<uint64_t> CHUNKING_WRITER_MAX_CHUNK_SIZE;
   static Entry<uint64_t> CHUNKING_WRITER_WIDE_SCHEMA_MAX_CHUNK_SIZE;
+  /// VARCHAR subfield paths whose value streams prefer FSST, falling back to
+  /// Trivial when FSST misses its compression target. FSST and its fallback use
+  /// the normal encoding compression policy. Paths use Velox subfield syntax:
+  /// nested ROW fields use '.', while ARRAY elements and MAP values use '[*]'.
+  /// Examples: top_level, nested.target, items[*], properties[*], and
+  /// metadata[*].label. A retained cluster-index key data stream may be
+  /// targeted; a key omitted from normal data storage is ignored. This option
+  /// does not alter the cluster-index key stream. Targeting the same value
+  /// stream with shared dictionary encoding is rejected. This option does not
+  /// change other streams.
+  /// A field whose literal name contains Velox subfield separators such as
+  /// '.', or any path containing ',', cannot be expressed by this
+  /// comma-delimited SerDe option.
+  /// EXPERIMENTAL: Do not enable for production tables without consulting the
+  /// Nimble team (oncall: dwios).
+  // @lint-ignore CLANGTIDY facebook-hte-NonPodStaticDeclaration
+  static Entry<const std::vector<std::string>> FSST_COLUMNS;
 
   /// Selects and tunes the writer flush policy via a comma-separated
   /// "key:value" spec whose "type" key chooses the policy. An absent key keeps

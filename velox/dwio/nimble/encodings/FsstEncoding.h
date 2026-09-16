@@ -81,11 +81,14 @@ namespace facebook::nimble {
 ///
 /// Binary layout:
 /// - Encoding::kPrefixSize bytes: standard Encoding prefix
+/// - For a secondarily compressed blob only: 1-byte zero marker followed by
+///   the 1-byte compression type. Legacy and uncompressed encodings omit this.
 /// - varint: serialized FSST symbol table size
 /// - N bytes: serialized FSST symbol table (~2KB typical)
 /// - varint: lengths encoding size
 /// - M bytes: nested encoding of compressed string lengths
-/// - K bytes: compressed string blob (concatenated FSST-compressed strings)
+/// - K bytes: concatenated FSST output, optionally compressed by the normal
+///   Nimble encoding-layer compression policy
 ///
 /// Only supports std::string_view data type.
 class FsstEncoding final
@@ -131,6 +134,12 @@ class FsstEncoding final
       std::string_view encoding,
       const Encoding::Options& options = {});
 
+  /// Returns the compression type of the FSST-compressed string blob.
+  /// Legacy encodings without the extended header are uncompressed.
+  static CompressionType compressionType(
+      std::string_view encoding,
+      const Encoding::Options& options = {});
+
   /// Captures FSST's nested compressed-lengths encoding layout.
   static void captureNestedEncoding(
       std::string_view encoding,
@@ -148,6 +157,10 @@ class FsstEncoding final
 
   static constexpr size_t kStringPageSize = 256 * 1024;
 
+  // A serialized FSST symbol table is never empty. Zero therefore introduces
+  // the extended header without making legacy encodings ambiguous.
+  static constexpr uint32_t kExtendedHeaderMarker = 0;
+
   struct StringPageSlot {
     // Non-owning page address returned by stringBufferFactory_.
     char* data;
@@ -156,13 +169,16 @@ class FsstEncoding final
   };
 
   struct Header {
+    // Secondary compression applied to the concatenated FSST output.
+    CompressionType compressionType{CompressionType::Uncompressed};
+
     // Serialized FSST symbol table.
     std::string_view symbolTable;
 
     // Nested encoding for per-row compressed string sizes.
     std::string_view lengths;
 
-    // Concatenated FSST-compressed string data.
+    // Serialized blob, which may have secondary encoding-layer compression.
     std::string_view blob;
   };
 
@@ -215,7 +231,8 @@ class FsstEncoding final
       std::span<const physicalType> values,
       velox::memory::MemoryPool* pool);
 
-  // Checks whether the final FSST encoding meets the compression target.
+  // Checks whether the native FSST representation meets the compression target
+  // before optional encoding-layer compression is applied.
   static bool meetsCompressionTarget(
       uint64_t uncompressedSize,
       uint64_t encodedSize,
@@ -257,7 +274,8 @@ class FsstEncoding final
   // Nested encoding for compressed string lengths.
   std::unique_ptr<Encoding> lengths_;
 
-  // Compressed string blob and the current byte offset within it.
+  // Unwrapped FSST string blob and the current byte offset within it.
+  velox::BufferPtr uncompressedBlob_;
   std::string_view blob_;
   size_t blobOffset_{0};
 

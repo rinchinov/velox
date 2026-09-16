@@ -477,6 +477,7 @@ TEST_F(FsstEncodingTest, roundTripStrings) {
   std::string longString2(10'000, 'b');
 
   std::vector<TestCase> testCases{
+      {"empty input", {}, EncodingType::Trivial},
       {"basic strings", {"hello", "world", "hello world", "foo", "bar", "baz"}},
       {"all empty strings", {"", "", "", ""}, EncodingType::Trivial},
       {"mixed empty and non-empty", {"", "abc", "", "def", ""}},
@@ -493,6 +494,98 @@ TEST_F(FsstEncodingTest, roundTripStrings) {
   for (const auto& testCase : testCases) {
     roundTrip(testCase.values, testCase.name, testCase.expectedEncodingType);
   }
+}
+
+TEST_F(FsstEncodingTest, compressesFsstBlobWithConfiguredPolicy) {
+  std::vector<std::string> storage;
+  storage.reserve(4'096);
+  for (uint32_t i = 0; i < 4'096; ++i) {
+    storage.emplace_back(
+        fmt::format(
+            "common/prefix/with/repeated/fsst/data/{:04}/common/suffix",
+            i % 32));
+  }
+  const std::vector<std::string_view> values(storage.begin(), storage.end());
+
+  CompressionOptions compressionOptions;
+  compressionOptions.compressionAcceptRatio = 1.0;
+  compressionOptions.zstdMinCompressionSize = 0;
+  compressionOptions.lz4MinCompressionSize = 0;
+
+  for (const auto compressionType :
+       {CompressionType::Zstd, CompressionType::Lz4}) {
+    SCOPED_TRACE(toString(compressionType));
+    compressionOptions.compressionType = compressionType;
+    Buffer buffer{*pool_};
+    const auto encoded = EncodingFactory::encode<std::string_view>(
+        createSelectionPolicy(compressionOptions, compressionType),
+        values,
+        buffer,
+        {.fsstCompressionTargetRatio = std::numeric_limits<double>::max()});
+
+    ASSERT_EQ(EncodingPrefix::encodingType(encoded), EncodingType::Fsst);
+    EXPECT_EQ(FsstEncoding::compressionType(encoded), compressionType);
+    EXPECT_EQ(
+        EncodingLayoutCapture::capture(encoded, {}).compressionType(),
+        compressionType);
+
+    stringBuffers_.clear();
+    auto encoding = EncodingFactory().create(
+        *pool_, encoded, createStringBufferFactory(), Encoding::Options{});
+    std::vector<std::string_view> decoded(values.size());
+    encoding->materialize(static_cast<uint32_t>(values.size()), decoded.data());
+    EXPECT_EQ(decoded, values);
+
+    Buffer sliceBuffer{*pool_};
+    const auto sliced =
+        FsstEncoding::slice(encoded, /*offset=*/17, /*length=*/83, sliceBuffer);
+    EXPECT_EQ(
+        FsstEncoding::compressionType(sliced), CompressionType::Uncompressed);
+    stringBuffers_.clear();
+    auto slicedEncoding = EncodingFactory().create(
+        *pool_, sliced, createStringBufferFactory(), Encoding::Options{});
+    std::vector<std::string_view> slicedValues(83);
+    slicedEncoding->materialize(
+        static_cast<uint32_t>(slicedValues.size()), slicedValues.data());
+    EXPECT_EQ(
+        slicedValues,
+        std::vector<std::string_view>(
+            values.begin() + 17, values.begin() + 100));
+  }
+}
+
+TEST_F(FsstEncodingTest, preservesLegacyLayoutWhenCompressionIsRejected) {
+  std::vector<std::string> storage;
+  storage.reserve(512);
+  for (uint32_t i = 0; i < 512; ++i) {
+    storage.emplace_back(fmt::format("fsst/value/with/random/suffix/{:04}", i));
+  }
+  const std::vector<std::string_view> values(storage.begin(), storage.end());
+
+  CompressionOptions compressionOptions;
+  compressionOptions.compressionType = CompressionType::Zstd;
+  compressionOptions.compressionAcceptRatio = 0;
+  compressionOptions.zstdMinCompressionSize = 0;
+
+  Buffer buffer{*pool_};
+  const auto encoded = EncodingFactory::encode<std::string_view>(
+      createSelectionPolicy(compressionOptions, CompressionType::Zstd),
+      values,
+      buffer,
+      {.fsstCompressionTargetRatio = std::numeric_limits<double>::max()});
+
+  ASSERT_EQ(EncodingPrefix::encodingType(encoded), EncodingType::Fsst);
+  EXPECT_EQ(
+      FsstEncoding::compressionType(encoded), CompressionType::Uncompressed);
+  const char* header =
+      encoded.data() + EncodingPrefix::prefixSize(encoded, false);
+  EXPECT_GT(varint::readVarint32(&header), 0);
+
+  auto encoding = EncodingFactory().create(
+      *pool_, encoded, createStringBufferFactory(), Encoding::Options{});
+  std::vector<std::string_view> decoded(values.size());
+  encoding->materialize(static_cast<uint32_t>(values.size()), decoded.data());
+  EXPECT_EQ(decoded, values);
 }
 
 TEST_F(FsstEncodingTest, slice) {

@@ -24,6 +24,7 @@
 #include "folly/ScopeGuard.h"
 #include "velox/common/Casts.h"
 #include "velox/dwio/nimble/common/Varint.h"
+#include "velox/dwio/nimble/compression/Compression.h"
 #include "velox/dwio/nimble/encodings/FixedBitWidthEncoding.h"
 #include "velox/dwio/nimble/encodings/TrivialEncoding.h"
 #include "velox/dwio/nimble/encodings/common/EncodingFactory.h"
@@ -147,7 +148,14 @@ FsstEncoding::Header FsstEncoding::parseHeader(
       offset, encoding.size(), "FSST header offset exceeds encoding bounds.");
 
   Header header{};
-  const auto symbolTableSize = readFsstHeaderVarint(encoding, offset);
+  auto symbolTableSize = readFsstHeaderVarint(encoding, offset);
+  if (symbolTableSize == kExtendedHeaderMarker) {
+    NIMBLE_CHECK_LT(
+        offset, encoding.size(), "Truncated FSST compression type.");
+    header.compressionType =
+        static_cast<CompressionType>(static_cast<uint8_t>(encoding[offset++]));
+    symbolTableSize = readFsstHeaderVarint(encoding, offset);
+  }
   NIMBLE_CHECK_GT(
       symbolTableSize, 0, "FSST symbol table size must be positive.");
   NIMBLE_CHECK_LE(
@@ -405,7 +413,18 @@ FsstEncoding::FsstEncoding(
       lengths->rowCount(),
       this->rowCount(),
       "FSST lengths row count does not match the parent encoding.");
-  blob_ = header.blob;
+  if (header.compressionType == CompressionType::Uncompressed) {
+    blob_ = header.blob;
+  } else {
+    uncompressedBlob_ = Compression::uncompress(
+        pool,
+        header.compressionType,
+        DataType::String,
+        header.blob,
+        options.decompressCounter(),
+        options.bufferPool);
+    blob_ = {uncompressedBlob_->as<char>(), uncompressedBlob_->size()};
+  }
 }
 
 std::string_view FsstEncoding::lengthsEncoding(
@@ -416,6 +435,15 @@ std::string_view FsstEncoding::lengthsEncoding(
       EncodingPrefix::prefixSize(encoding, options.useVarintRowCount);
   const auto header = parseHeader(encoding, prefixSize);
   return header.lengths;
+}
+
+CompressionType FsstEncoding::compressionType(
+    std::string_view encoding,
+    const Encoding::Options& options) {
+  validateEncodedPrefix(encoding, options);
+  const auto prefixSize =
+      EncodingPrefix::prefixSize(encoding, options.useVarintRowCount);
+  return parseHeader(encoding, prefixSize).compressionType;
 }
 
 void FsstEncoding::captureNestedEncoding(
@@ -610,6 +638,10 @@ std::string_view FsstEncoding::encode(
     std::span<const physicalType> values,
     Buffer& buffer,
     const Encoding::Options& options) {
+  if (values.empty()) {
+    return encodeTrivialFallback(selection, values, buffer, options);
+  }
+
   {
     auto compressedValues = compressValues(values, &buffer.getMemoryPool());
 
@@ -624,7 +656,7 @@ std::string_view FsstEncoding::encode(
 
     const bool useVarint = options.useVarintRowCount;
     const auto valueCount = static_cast<uint32_t>(values.size());
-    const uint32_t encodingSize =
+    const uint32_t uncompressedEncodingSize =
         Encoding::serializePrefixSize(valueCount, useVarint) +
         varint::varintSize(compressedValues.symbolTableSize) +
         compressedValues.symbolTableSize +
@@ -633,23 +665,40 @@ std::string_view FsstEncoding::encode(
 
     if (meetsCompressionTarget(
             compressedValues.totalInputSize,
-            encodingSize,
+            uncompressedEncodingSize,
             options.fsstCompressionTargetRatio)) {
+      auto compressionPolicy = selection.compressionPolicy();
+      const auto* checkedCompressionPolicy =
+          velox::checkedNotNull(compressionPolicy.get());
+      CompressionEncoder<std::string_view> compressionEncoder{
+          buffer.getMemoryPool(),
+          *checkedCompressionPolicy,
+          DataType::String,
+          {reinterpret_cast<const char*>(
+               compressedValues.compressedBuffer.data()),
+           compressedValues.totalCompressedSize}};
+      const bool isCompressed =
+          compressionEncoder.compressionType() != CompressionType::Uncompressed;
+      const size_t encodingSize = uncompressedEncodingSize -
+          compressedValues.totalCompressedSize + compressionEncoder.getSize() +
+          (isCompressed ? varint::varintSize(kExtendedHeaderMarker) +
+                   sizeof(CompressionType)
+                        : 0);
       char* reserved = buffer.reserve(encodingSize);
       char* pos = reserved;
       Encoding::serializePrefix(
           EncodingType::Fsst, DataType::String, valueCount, useVarint, pos);
+      if (isCompressed) {
+        varint::writeVarint(kExtendedHeaderMarker, &pos);
+        encoding::writeChar(
+            static_cast<char>(compressionEncoder.compressionType()), pos);
+      }
       encoding::writeVarintString(
           {reinterpret_cast<const char*>(compressedValues.symbolTableData),
            compressedValues.symbolTableSize},
           pos);
       encoding::writeVarintString(serializedLengths, pos);
-      for (uint32_t i = 0; i < valueCount; ++i) {
-        encoding::writeBytes(
-            {reinterpret_cast<const char*>(compressedValues.compressedPtrs[i]),
-             compressedValues.compressedLengths[i]},
-            pos);
-      }
+      compressionEncoder.write(pos);
 
       NIMBLE_CHECK_EQ(pos - reserved, encodingSize, "Encoding size mismatch.");
       return {reserved, encodingSize};
@@ -675,6 +724,19 @@ std::string_view FsstEncoding::slice(
   const auto header = parseHeader(
       encoded, EncodingPrefix::prefixSize(encoded, options.useVarintRowCount));
   validateSymbolTable(header.symbolTable);
+
+  velox::BufferPtr uncompressedBlob;
+  auto blob = header.blob;
+  if (header.compressionType != CompressionType::Uncompressed) {
+    uncompressedBlob = Compression::uncompress(
+        buffer.getMemoryPool(),
+        header.compressionType,
+        DataType::String,
+        header.blob,
+        options.decompressCounter(),
+        options.bufferPool);
+    blob = {uncompressedBlob->as<char>(), uncompressedBlob->size()};
+  }
 
   const auto rowEnd = offset + length;
   Vector<uint32_t> materializedLengths{&buffer.getMemoryPool(), rowEnd};
@@ -705,11 +767,11 @@ std::string_view FsstEncoding::slice(
       materializedLengths.end(),
       size_t{0});
   validateCompressedLengths(
-      {materializedLengths.data(), materializedLengths.size()}, header.blob, 0);
+      {materializedLengths.data(), materializedLengths.size()}, blob, 0);
   if (rowEnd == sourceRowCount) {
     NIMBLE_CHECK_FILE_EQ(
         blobOffset + blobBytes,
-        header.blob.size(),
+        blob.size(),
         "FSST compressed lengths do not match the blob size.");
   }
 
@@ -749,7 +811,7 @@ std::string_view FsstEncoding::slice(
       pos);
   encoding::writeVarintString(header.symbolTable, pos);
   encoding::writeVarintString(slicedLengths, pos);
-  encoding::writeBytes(header.blob.substr(blobOffset, blobBytes), pos);
+  encoding::writeBytes(blob.substr(blobOffset, blobBytes), pos);
   NIMBLE_CHECK_EQ(
       static_cast<uint64_t>(pos - reserved),
       encodingSize,

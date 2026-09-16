@@ -187,6 +187,8 @@ EncodingLayout EncodingLayoutCapture::capture(
       encodingType == EncodingType::FOR) {
     compressionType =
         encoding::peek<uint8_t, CompressionType>(encoding.data() + prefixSize);
+  } else if (encodingType == EncodingType::Fsst) {
+    compressionType = FsstEncoding::compressionType(encoding, options);
   }
 
   EncodingLayout::Config encodingConfig;

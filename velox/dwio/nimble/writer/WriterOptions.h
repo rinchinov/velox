@@ -236,6 +236,19 @@ struct WriterOptions {
   /// encodings, based on history data.
   std::optional<EncodingLayoutTree> encodingLayoutTree{};
 
+  /// Velox subfield paths whose stored VARCHAR value streams prefer FSST.
+  /// Paths identify fields in the input schema and are resolved to the matching
+  /// stored data streams during construction; nested ROW fields use '.', while
+  /// ARRAY elements and MAP values use '[*]'. A retained cluster-index key data
+  /// stream may be targeted; a key omitted from normal data storage is ignored.
+  /// The cluster-index key stream remains controlled by its own encoding
+  /// layout. A chunk that misses FSST's compression target safely falls back to
+  /// Trivial. FSST and its fallback use the writer's normal encoding
+  /// compression policy. Targeting the same value stream with shared dictionary
+  /// encoding is rejected. Field names containing Velox subfield separators
+  /// such as '.' are not addressable as literal names through this interface.
+  std::vector<std::string> fsstEncodingSubfields{};
+
   /// Compression settings to be used when encoding and compressing data streams
   CompressionOptions compressionOptions{};
 
